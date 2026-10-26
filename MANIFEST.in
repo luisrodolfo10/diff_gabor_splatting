@@ -1,0 +1,9 @@
+include LICENSE.md NOTICE.md README.md references.bib
+recursive-include src/gabor_splatting/csrc *.h *.cpp *.cu
+include src/gabor_splatting/py.typed
+recursive-include docs *.md
+recursive-include examples *.py
+recursive-include benchmarks *.py
+recursive-include tests *.py
+recursive-include benchmarks/results *.json
+recursive-include assets *.png

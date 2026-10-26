@@ -1,0 +1,13 @@
+name: Static checks
+on: [push, pull_request]
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+      - run: uvx ruff check .
+      - run: uvx ruff format --check .
+      - run: uv run --no-project python -m compileall -q src tests examples benchmarks setup.py

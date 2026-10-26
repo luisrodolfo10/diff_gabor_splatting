@@ -1,0 +1,14 @@
+name: CUDA validation (GPU runner)
+on: workflow_dispatch
+jobs:
+  cuda:
+    runs-on: [self-hosted, linux, x64, gpu]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+      - run: uv sync --extra dev
+      - run: uv run pytest -q
+      - run: uv run python benchmarks/benchmark_rasterization.py --num-primitives 200 --num-scenes 2 --num-cameras 2 --image-width 32 --image-height 24 --warmup-iterations 1 --measurement-iterations 2
+      - run: uv build

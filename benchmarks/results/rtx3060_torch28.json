@@ -1,0 +1,84 @@
+{
+  "environment": {
+    "gpu": "NVIDIA GeForce RTX 3060 Laptop GPU",
+    "torch": "2.8.0+cu128",
+    "cuda": "12.8",
+    "python": "3.12.3",
+    "revision": null
+  },
+  "workload": {
+    "method": "both",
+    "num_primitives": 10000,
+    "num_scenes": 1,
+    "num_cameras": 4,
+    "image_width": 256,
+    "image_height": 256,
+    "warmup_iterations": 5,
+    "measurement_iterations": 20,
+    "seed": 42
+  },
+  "timing": "CUDA events; forward includes autograd graph construction and scalar loss; combined throughput includes backward",
+  "memory": "peak total PyTorch-allocated CUDA memory in decimal MB, including inputs and autograd state",
+  "results": [
+    {
+      "implementation": "single_view_loop",
+      "forward_ms": 20.238782501220705,
+      "backward_ms": 17.84941759109497,
+      "forward_backward_ms": 38.088200092315674,
+      "images_per_second": 105.0194020800422,
+      "peak_allocated_memory_mb": 83.375104,
+      "method": "classic",
+      "speedup_vs_single_view_loop": 1.0
+    },
+    {
+      "implementation": "fused_dense",
+      "forward_ms": 6.936303973197937,
+      "backward_ms": 10.853780746459961,
+      "forward_backward_ms": 17.790084719657898,
+      "images_per_second": 224.84434801932295,
+      "peak_allocated_memory_mb": 79.514624,
+      "method": "classic",
+      "speedup_vs_single_view_loop": 2.1409791292465585
+    },
+    {
+      "implementation": "fused_packed",
+      "forward_ms": 7.289059209823608,
+      "backward_ms": 11.706064033508301,
+      "forward_backward_ms": 18.99512324333191,
+      "images_per_second": 210.58036574751725,
+      "peak_allocated_memory_mb": 79.5136,
+      "method": "classic",
+      "speedup_vs_single_view_loop": 2.005156776526114
+    },
+    {
+      "implementation": "single_view_loop",
+      "forward_ms": 23.05581111907959,
+      "backward_ms": 20.20671682357788,
+      "forward_backward_ms": 43.26252794265747,
+      "images_per_second": 92.45876721077926,
+      "peak_allocated_memory_mb": 91.332608,
+      "method": "neural",
+      "speedup_vs_single_view_loop": 1.0
+    },
+    {
+      "implementation": "fused_dense",
+      "forward_ms": 7.916827201843262,
+      "backward_ms": 13.81340970993042,
+      "forward_backward_ms": 21.73023691177368,
+      "images_per_second": 184.07530558641798,
+      "peak_allocated_memory_mb": 83.646976,
+      "method": "neural",
+      "speedup_vs_single_view_loop": 1.9908907628714052
+    },
+    {
+      "implementation": "fused_packed",
+      "forward_ms": 7.429587244987488,
+      "backward_ms": 12.582340908050536,
+      "forward_backward_ms": 20.011928153038024,
+      "images_per_second": 199.8807895676338,
+      "peak_allocated_memory_mb": 83.647488,
+      "method": "neural",
+      "speedup_vs_single_view_loop": 2.161837060967549
+    }
+  ]
+}
