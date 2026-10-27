@@ -71,7 +71,11 @@ def render_maps(scene, args, method, implementation):
     def call(values, packed=False):
         """Invoke the renderer and collect all differentiable channels."""
         rgb, alpha, meta = function(
-            **values, width=args.image_width, height=args.image_height, packed=packed
+            **values,
+            width=args.image_width,
+            height=args.image_height,
+            packed=packed,
+            validate=not args.skip_validation,
         )
         return torch.cat(
             (rgb, alpha, meta["accumulated_depth"], meta["normals"], meta["distortion"]), -1
@@ -145,6 +149,35 @@ def measure(scene, args, method, implementation):
     }
 
 
+def profile_kernels(scene, args, method, implementation):
+    """Profile CUDA kernels separately from the uninstrumented latency measurements."""
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+    ) as profile:
+        for _ in range(args.profile_iterations):
+            for value in scene.values():
+                value.grad = None
+            render_maps(scene, args, method, implementation).square().mean().backward()
+        torch.cuda.synchronize()
+    kernels = {}
+    for event in profile.events():
+        if event.device_type == torch.autograd.DeviceType.CUDA:
+            kernels[event.name] = (
+                kernels.get(event.name, 0.0)
+                + event.device_time_total / 1000 / args.profile_iterations
+            )
+    forward = sum(ms for name, ms in kernels.items() if "renderForward<" in name)
+    backward = sum(ms for name, ms in kernels.items() if "renderBackward<" in name)
+    if not forward or not backward:
+        raise RuntimeError("profiler did not capture the forward/backward compositor kernels")
+    return {
+        "forward_kernel_ms": forward,
+        "backward_kernel_ms": backward,
+        "other_cuda_kernel_ms": sum(kernels.values()) - forward - backward,
+        "kernels_ms": kernels,
+    }
+
+
 def main():
     """Parse a small explicit workload, verify parity, and emit reproducible results."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -157,6 +190,13 @@ def main():
     parser.add_argument("--warmup-iterations", type=int, default=5)
     parser.add_argument("--measurement-iterations", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--profile-iterations",
+        type=int,
+        default=0,
+        help="separately profile this many steps per implementation; 0 disables profiling",
+    )
+    parser.add_argument("--skip-validation", action="store_true")
     parser.add_argument("--output-json", type=Path)
     args = parser.parse_args()
     for name in [
@@ -169,8 +209,8 @@ def main():
     ]:
         if getattr(args, name) < 1:
             parser.error(f"--{name.replace('_', '-')} must be positive")
-    if args.warmup_iterations < 0:
-        parser.error("--warmup-iterations must be nonnegative")
+    if args.warmup_iterations < 0 or args.profile_iterations < 0:
+        parser.error("--warmup-iterations and --profile-iterations must be nonnegative")
     revision = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True)
     report = {
         "environment": {
@@ -182,6 +222,7 @@ def main():
         },
         "workload": {name: value for name, value in vars(args).items() if name != "output_json"},
         "timing": "CUDA events; forward includes autograd graph construction and scalar loss; combined throughput includes backward",
+        "profiling": "optional separate CUDA trace; kernel times include instrumentation overhead",
         "memory": "peak total PyTorch-allocated CUDA memory in decimal MB, including inputs and autograd state",
         "results": [],
     }
@@ -191,6 +232,8 @@ def main():
         baseline = None
         for implementation in ["single_view_loop", "fused_dense", "fused_packed"]:
             result = measure(scene, args, method, implementation)
+            if args.profile_iterations:
+                result.update(profile_kernels(scene, args, method, implementation))
             if baseline is None:
                 baseline = result["forward_backward_ms"]
             result.update(

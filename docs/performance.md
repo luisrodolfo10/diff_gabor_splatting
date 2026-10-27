@@ -20,89 +20,75 @@ device, contiguity, and scalar checks remain enabled. The default is still
 `validate=True`; tile-intersection allocation still requires a synchronization.
 Projection remains in PyTorch.
 
-## Profile an actual trained tile
+## Dataset-independent benchmark
 
-Export the arguments at the public renderer boundary from the existing training
-or profile script. Keep its image size, camera, activated primitive parameters,
-SH degree, packing mode, and target image. This avoids coupling the benchmark to
-an application's checkpoint layout:
-
-```python
-import torch
-
-# inputs is the exact keyword-argument dictionary passed to the public renderer.
-# target_rgb is float32 RGB in [..., C, H, W, 3] or [H, W, 3], with one camera/tile.
-# trainable lists the input tensors whose gradients the training workload needs.
-torch.save(
-    {
-        "method": "classic",  # or "neural"
-        "inputs": inputs,
-        "target": target_rgb,
-        "trainable": trainable,
-    },
-    "frame100_classic_tile.pt",
-)
-```
-
-The bundle must contain tensors and ordinary scalar/container values, suitable
-for `torch.load(..., weights_only=True)`. Exclude `validate` from `inputs`; select
-that behavior with the command-line flag. Camera/primitive dimensions follow the
-[public contracts](contracts.md), and the bundle must describe exactly one image.
+The benchmark generates deterministic synthetic Gabor primitives and cameras.
+It needs no datasets, model files, or application-specific training code.
+Classic and neural methods use the same geometry and camera workload.
 
 ```bash
-uv run python benchmarks/benchmark_real_scene.py frame100_classic_tile.pt --skip-validation --max-step-ms 25 --output-json classic-profile.json
-uv run python benchmarks/benchmark_real_scene.py frame100_neural_tile.pt --skip-validation --max-step-ms 35 --output-json neural-profile.json
+uv run python benchmarks/benchmark_rasterization.py --method both --output-json results.json
+uv run python benchmarks/benchmark_rasterization.py --num-primitives 50000 --num-scenes 2 --num-cameras 4 --image-width 512 --image-height 512
+uv run python benchmarks/benchmark_rasterization.py --method both --profile-iterations 5 --skip-validation --output-json profile.json
 ```
 
-The measured objective is render + RGB L1 loss + backward to the specified input
-tensors. It excludes loading, device copies, model activations before the renderer,
-optimizer updates, and densification. Match those exclusions and the loss when
-comparing it with an application's training-step profile.
+Configure primitive count, scene count, camera count, image dimensions, seed,
+warmup iterations, and measurement iterations explicitly. Defaults are 10,000
+primitives, one scene, four cameras, 256×256 images, seed 42, five warmups, and
+20 measured iterations.
 
-`step_ms` uses CUDA events; `wall_ms_per_step` also includes host execution.
-The kernel split comes from a separate CUPTI-backed PyTorch profiler trace:
-`forward_kernel_ms`, `backward_kernel_ms`, `sh_kernel_ms`, and per-kernel timings.
-`other_cuda_kernel_ms` includes SH, projection, binning, loss, and other kernels;
-it is not a claim to measure only PyTorch work or CPU overhead. Profiled kernel
-times can differ from unprofiled step times because instrumentation and GPU clocks
-change execution. Missing kernel capture is an error, not a zero-time result.
-Run profiles serially on an otherwise idle GPU. `--max-step-ms` saves the report
-and exits unsuccessfully if the measured mean exceeds the explicit budget.
+Each method compares a single-view loop, fused dense rendering, and fused packed
+rendering. Image and parameter-gradient parity are checked before timing.
+The objective is the mean square of the concatenated RGB, alpha, accumulated
+depth, normals, and distortion maps, followed by backward. Inputs are fixed
+throughout measurement; no optimizer updates are performed. Scene generation,
+IO, and parity checks are excluded from timing.
 
-## Available validation and remaining target measurements
+CUDA events measure forward (including the scalar loss), backward, and combined
+latency. The report also records throughput, peak allocated CUDA memory,
+environment, workload settings, and speedup relative to the single-view loop.
+The memory figure includes inputs and autograd state.
 
-The frame-100 model inputs, their original profile script, the RTX 3090, and the
-cu129 deployment environment were unavailable in this workspace. The requested
-real-scene budgets (classic <=25 ms/step, neural <=35 ms/step at 1536×810) therefore
-remain **unverified**. No claim that these budgets have been met is made here.
+Numerical input checks are enabled by default. `--skip-validation` passes
+`validate=False` to the public renderers; structural checks still run.
 
-An explicit synthetic control was measured on the RTX 3060 Laptop GPU using
-197,000 primitives, one camera, a 1536×810 image, and seed 42. Geometry and direct
-appearance came from the existing synthetic benchmark's `make_scene` function.
-The SH variant uses degree-three coefficients with equivalent DC colors and zero
-higher coefficients. This is not a substitute for the trained models.
+### Optional kernel profile
 
-The compact results and measurement settings are in
-[v011_rtx3060_control.json](../benchmarks/results/v011_rtx3060_control.json).
-The matched control measured classic backward at 173.0 → 51.8 ms (3.34x) and
-neural backward at 261.0 → 94.5 ms (2.76x). Total render/L1/backward latency was
-215.9 → 80.8 ms for classic and 297.8 → 122.4 ms for neural. Compare validation
-modes in the report: the neural and SH candidates use `validate=False`; the
-classic direct-color comparison keeps validation enabled in both versions.
+`--profile-iterations N` collects a separate PyTorch CUDA profiler trace for
+each implementation after its latency measurements. JSON results include
+`forward_kernel_ms`, `backward_kernel_ms`, `other_cuda_kernel_ms`, and
+`kernels_ms`. Other CUDA time includes projection, binning, loss, and gradient
+operations. It does not measure CPU overhead. Instrumented kernel times can
+differ from unprofiled timings; missing compositor capture raises an error.
+Profiling is disabled by default.
 
-Each case used five warmups, 12 measured steps, and three profiled steps. All
-control processes were pinned to CPU 4. Unpinned runs on this host exposed a
-PyTorch 2.8 `ApproximateClock` non-monotonic timestamp error and incomplete CUDA
-traces. If that profiler error occurs, pin the process to an available CPU with
-`taskset -c <cpu> uv run python benchmarks/benchmark_real_scene.py ...`. The
-benchmark records CPU affinity and fails when compositor kernel capture is
-missing; it does not substitute zero timings or retry silently.
+Run benchmarks serially on an otherwise idle GPU. On the validation host,
+unpinned profiling exposed a PyTorch 2.8 `ApproximateClock` non-monotonic
+timestamp error. If encountered, pin the process to an available CPU with
+`taskset -c <cpu> uv run python benchmarks/benchmark_rasterization.py ...`.
 
-Correctness includes the original suite and upstream output comparisons, plus
-independent SH polynomial/gradient parity at every supported degree, trusted-input
-path parity, and full/tail shared-batch coverage. Compute Sanitizer memcheck also
-checks multi-scene/camera, partial-tile, packed/dense, and SH camera-sharing stress
-cases. Racecheck additionally reports zero hazards for shared-batch/tail and
-partial-tile stress cases. The release is prepared locally; publishing the tag, rebuilding a cu129
-wheel, updating an external application's pin, and rerunning its original profile
-require the corresponding deployment environment and publication approval.
+## Recorded optimization control
+
+The [recorded control](../benchmarks/results/v011_rtx3060_control.json) compares
+v0.1.0 with v0.1.1 on an RTX 3060 Laptop GPU: 197,000 synthetic primitives, one
+scene/camera, a 1536×810 image, and seed 42. Geometry and direct appearance were
+generated by `make_scene`. The SH variant uses degree-three coefficients with
+equivalent DC colors and zero higher coefficients.
+
+This historical control used render + RGB L1 loss + backward, rather than the
+all-map square loss used by the configurable benchmark above. Each case used
+five warmups, 12 measured steps, and three profiled steps, pinned to CPU 4.
+
+Classic backward measured 173.0 → 51.8 ms (3.34x), and neural backward measured
+261.0 → 94.5 ms (2.76x). Combined render/L1/backward latency was 215.9 → 80.8 ms
+for classic and 297.8 → 122.4 ms for neural. The neural and SH candidates use
+`validate=False`; the classic direct-color comparison keeps validation enabled
+in both versions. These measurements describe this hardware and workload;
+performance varies with primitive coverage, overlap, resolution, and batching.
+
+Correctness includes the original suite and upstream output comparisons,
+independent SH polynomial/gradient parity at every supported degree,
+trusted-input path parity, and full/tail shared-batch coverage. Compute Sanitizer
+memcheck reports zero errors for multi-scene/camera, partial-tile, packed/dense,
+and SH camera-sharing stress cases. Racecheck reports zero hazards for
+shared-batch/tail and partial-tile stress cases.

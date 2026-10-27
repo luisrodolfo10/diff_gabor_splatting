@@ -31,8 +31,8 @@ Both rendering methods are installed together in one CUDA extension.
   direction gradients.
 - `validate=False` skips numerical value checks on trusted inputs while retaining
   shape, dtype, device, and layout checks. The default remains `validate=True`.
-- A [real-tile profiler](benchmarks/benchmark_real_scene.py) reports step latency
-  and separate CUDA kernel times. See [performance validation](docs/performance.md).
+- The [synthetic benchmark](benchmarks/benchmark_rasterization.py) reports latency
+  and optional CUDA kernel times for configurable Gabor workloads. See [performance validation](docs/performance.md).
 
 ## Requirements
 
@@ -245,15 +245,15 @@ backward, combined latency, throughput, peak allocated CUDA memory, and speedup
 relative to the loop within each method. Scene creation and IO are excluded.
 The default is 10,000 primitives, one scene, four cameras, and 256×256 images.
 
-To profile exported inputs from an actual trained model and image tile:
+To include a separate CUDA kernel profile and skip numerical input checks:
 
 ```bash
-uv run python benchmarks/benchmark_real_scene.py frame100_classic_tile.pt --skip-validation --output-json classic-profile.json
+uv run python benchmarks/benchmark_rasterization.py --method both --profile-iterations 5 --skip-validation --output-json profile.json
 ```
 
-The [performance guide](docs/performance.md) describes the tensor bundle and
-explains which work the benchmark measures. It does not generate a synthetic
-replacement when a checkpoint or tile is missing.
+All inputs are generated deterministically from the seed; no dataset or model
+files are needed. See the [performance guide](docs/performance.md) for measurement
+details and recorded results.
 
 ## Validation
 

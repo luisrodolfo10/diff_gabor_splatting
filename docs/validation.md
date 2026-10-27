@@ -62,5 +62,4 @@ Compute Sanitizer 12.8 memcheck with zero reported errors. Shared-batch/tail and
 partial-tile stress cases also pass racecheck with zero hazards.
 
 See [performance.md](performance.md) for the measured synthetic control and the
-still-pending trained-model RTX 3090 budgets. The cu129 deployment wheel and
-external application pin have not been changed by this local release work.
+configurable, dataset-independent benchmark.

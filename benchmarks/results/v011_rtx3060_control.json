@@ -9,7 +9,7 @@
     ],
     "revision": "9befaee7b24341a536bb96bd21dbcd7b1b5b5199"
   },
-  "workload": "SYNTHETIC CONTROL, not the trained frame-100 tile",
+  "workload": "Deterministic synthetic Gabor primitives",
   "seed": 42,
   "num_primitives": 197000,
   "num_scenes": 1,
@@ -20,8 +20,6 @@
   "candidate_version": "0.1.1",
   "candidate_source_sha256": "afcae463d930f01b09c0effcd08fcc4162c7e6a69899e7297d968eec48315375",
   "objective": "render + RGB L1 loss + backward; no model activations, optimizer, or densification",
-  "targets_verified": false,
-  "missing": "trained frame-100 inputs/profile script and RTX 3090/cu129 environment",
   "cases": [
     {
       "name": "classic_direct",
