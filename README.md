@@ -21,6 +21,19 @@ sampling. Reproduce this image with the command in [Examples and benchmark](#exa
 The distribution is named `gabor-splatting` and imported as `gabor_splatting`.
 Both rendering methods are installed together in one CUDA extension.
 
+## Release notes
+
+### v0.1.1
+
+- Shared-memory primitive batches in forward and backward, with warp-reduced
+  geometry, opacity, appearance, and background gradients.
+- Fused CUDA evaluation/backward for both classic SH colors, including camera
+  direction gradients.
+- `validate=False` skips numerical value checks on trusted inputs while retaining
+  shape, dtype, device, and layout checks. The default remains `validate=True`.
+- A [real-tile profiler](benchmarks/benchmark_real_scene.py) reports step latency
+  and separate CUDA kernel times. See [performance validation](docs/performance.md).
+
 ## Requirements
 
 - Linux and Python 3.10 or newer, with Python development headers.
@@ -41,7 +54,7 @@ Add the tagged Git dependency to your project's `pyproject.toml`:
 [project]
 dependencies = [
   "torch==2.8.*",
-  "gabor-splatting @ git+https://github.com/luisrodolfo10/diff_gabor_splatting.git@v0.1.0",
+  "gabor-splatting @ git+https://github.com/luisrodolfo10/diff_gabor_splatting.git@v0.1.1",
 ]
 
 [tool.uv.extra-build-dependencies]
@@ -201,6 +214,14 @@ COLMAP loading, densification, and mesh extraction remain separate. The gsplat
 reference describes batching inspiration; gsplat is not a runtime dependency,
 and these functions have their own Gabor-specific arguments.
 
+### Trusted training inputs
+
+Both public renderers accept `validate=False` to skip numerical value checks
+once the caller guarantees the documented contracts. Structural checks remain
+active. This removes the value-check reductions and their synchronization; the
+variable-size tile-allocation synchronization remains. Projection stays in
+PyTorch. See [contracts](docs/contracts.md#differentiability-and-execution).
+
 ## Examples and benchmark
 
 ```bash
@@ -223,6 +244,16 @@ It checks image and parameter-gradient parity before timing. It reports forward,
 backward, combined latency, throughput, peak allocated CUDA memory, and speedup
 relative to the loop within each method. Scene creation and IO are excluded.
 The default is 10,000 primitives, one scene, four cameras, and 256×256 images.
+
+To profile exported inputs from an actual trained model and image tile:
+
+```bash
+uv run python benchmarks/benchmark_real_scene.py frame100_classic_tile.pt --skip-validation --output-json classic-profile.json
+```
+
+The [performance guide](docs/performance.md) describes the tensor bundle and
+explains which work the benchmark measures. It does not generate a synthetic
+replacement when a checkpoint or tile is missing.
 
 ## Validation
 

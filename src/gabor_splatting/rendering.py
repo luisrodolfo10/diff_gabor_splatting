@@ -218,64 +218,24 @@ def project_surfaces(
     return transform, xy, normals, directions, radii
 
 
-def evaluate_sh(degree: int, coeffs: torch.Tensor, directions: torch.Tensor) -> torch.Tensor:
-    """Evaluate real spherical harmonics up to degree three."""
+class SHColors(torch.autograd.Function):
+    """Fuse the two classic SH colors and their first-order CUDA derivatives."""
 
-    if degree < 0 or degree > 3:
-        raise ValueError("sh_degree must be between 0 and 3")
-    if coeffs.shape[-2] < (degree + 1) ** 2:
-        raise ValueError("colors does not contain enough SH coefficients")
-    x, y, z = directions.unbind(-1)
-    result = 0.28209479177387814 * coeffs[..., 0, :]
-    if degree > 0:
-        result = (
-            result
-            - 0.4886025119029199 * y[..., None] * coeffs[..., 1, :]
-            + 0.4886025119029199 * z[..., None] * coeffs[..., 2, :]
-            - 0.4886025119029199 * x[..., None] * coeffs[..., 3, :]
+    @staticmethod
+    def forward(ctx: Any, first, second, directions, degree):
+        """Evaluate both coefficient sets using a shared direction and SH basis."""
+        ctx.save_for_backward(first, second, directions)
+        ctx.degree = degree
+        return _C.evaluate_sh_forward(first, second, directions, degree)
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx: Any, grad_colors):
+        """Accumulate SH coefficient gradients across cameras and differentiate directions."""
+        gradients = _C.evaluate_sh_backward(
+            *ctx.saved_tensors, grad_colors.contiguous(), ctx.degree
         )
-    if degree > 1:
-        xx, yy, zz = x * x, y * y, z * z
-        xy, yz, xz = x * y, y * z, x * z
-        c2 = (
-            1.0925484305920792,
-            -1.0925484305920792,
-            0.31539156525252005,
-            -1.0925484305920792,
-            0.5462742152960396,
-        )
-        result = result + c2[0] * xy[..., None] * coeffs[..., 4, :]
-        result = result + c2[1] * yz[..., None] * coeffs[..., 5, :]
-        result = result + c2[2] * (2 * zz - xx - yy)[..., None] * coeffs[..., 6, :]
-        result = result + c2[3] * xz[..., None] * coeffs[..., 7, :]
-        result = result + c2[4] * (xx - yy)[..., None] * coeffs[..., 8, :]
-    if degree > 2:
-        c3 = (
-            -0.5900435899266435,
-            2.890611442640554,
-            -0.4570457994644658,
-            0.3731763325901154,
-            -0.4570457994644658,
-            1.445305721320277,
-            -0.5900435899266435,
-        )
-        result = result + c3[0] * y[..., None] * (3 * x * x - y * y)[..., None] * coeffs[..., 9, :]
-        result = result + c3[1] * (x * y * z)[..., None] * coeffs[..., 10, :]
-        result = result + (
-            c3[2] * y[..., None] * (4 * z * z - x * x - y * y)[..., None] * coeffs[..., 11, :]
-        )
-        result = result + (
-            c3[3]
-            * z[..., None]
-            * (2 * z * z - 3 * x * x - 3 * y * y)[..., None]
-            * coeffs[..., 12, :]
-        )
-        result = result + (
-            c3[4] * x[..., None] * (4 * z * z - x * x - y * y)[..., None] * coeffs[..., 13, :]
-        )
-        result = result + c3[5] * z[..., None] * (x * x - y * y)[..., None] * coeffs[..., 14, :]
-        result = result + c3[6] * x[..., None] * (x * x - 3 * y * y)[..., None] * coeffs[..., 15, :]
-    return (result + 0.5).clamp_min(0.0)
+        return *gradients, None
 
 
 def render(
@@ -294,6 +254,7 @@ def render(
     far_plane,
     neural,
     sh_degree,
+    validate,
 ):
     """Validate inputs, project scene/camera pairs, and call one image-aware compositor."""
     if not isinstance(means, torch.Tensor) or means.ndim < 2 or means.shape[-1] != 3:
@@ -353,9 +314,12 @@ def render(
         tensors[name] = tensor, batch + (n,) + shape
     for name, (tensor, shape) in tensors.items():
         check_tensor(name, tensor, shape, device)
-    check_values(
-        tensors, quaternions, scales, opacities, view_matrices, intrinsics, appearance, neural
-    )
+    if type(validate) is not bool:
+        raise TypeError("validate must be bool")
+    if validate:
+        check_values(
+            tensors, quaternions, scales, opacities, view_matrices, intrinsics, appearance, neural
+        )
     transform, xy, normals, directions, radii = project_surfaces(
         means.reshape(scenes, n, 3),
         quaternions.reshape(scenes, n, 4),
@@ -368,14 +332,14 @@ def render(
         far_plane,
     )
     if sh_degree is not None:
-        colors = [
-            evaluate_sh(
-                sh_degree, t.reshape(scenes, 1, n, (sh_degree + 1) ** 2, 3), directions
-            ).expand(scenes, cameras, n, 3)
-            for t in appearance[:2]
-        ]
+        colors = SHColors.apply(
+            appearance[0].reshape(scenes, n, (sh_degree + 1) ** 2, 3),
+            appearance[1].reshape(scenes, n, (sh_degree + 1) ** 2, 3),
+            directions,
+            sh_degree,
+        )
         rest = [t.reshape(scenes, 1, n, 4).expand(scenes, cameras, n, 4) for t in appearance[2:]]
-        parameters = torch.cat((*colors, *rest), dim=-1).reshape(-1, 18).contiguous()
+        parameters = torch.cat((colors, *rest), dim=-1).reshape(-1, 18).contiguous()
         opacity_parameters = (
             opacities.reshape(scenes, 1, n).expand(scenes, cameras, n).reshape(-1).contiguous()
         )
@@ -456,6 +420,7 @@ def rasterize_gabors(
     near_plane: float = 0.2,
     far_plane: float = 100.0,
     sh_degree: int | None = None,
+    validate: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
     """Render four-frequency Gabor surfaces over arbitrary scene and camera batches.
 
@@ -467,6 +432,8 @@ def rasterize_gabors(
     Cameras are [..., C, 4, 4] rigid world-to-camera transforms and [..., C, 3, 3]
     pinhole intrinsics. All tensors must be contiguous CUDA float32.
     Returns RGB [..., C, H, W, 3], alpha [..., C, H, W, 1], and named metadata.
+    validate=False skips numerical value checks for trusted inputs; shape,
+    dtype, device, and contiguity checks always remain enabled.
     See docs/contracts.md for pixel conventions, map definitions, and gradients.
     """
     return render(
@@ -485,6 +452,7 @@ def rasterize_gabors(
         far_plane,
         False,
         sh_degree,
+        validate,
     )
 
 
@@ -506,6 +474,7 @@ def rasterize_neural_gabors(
     packed: bool = False,
     near_plane: float = 0.2,
     far_plane: float = 100.0,
+    validate: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
     """Render per-surface 5→6→3 SIRENs with sine frequency 30 and sigmoid RGB.
 
@@ -515,6 +484,8 @@ def rasterize_neural_gabors(
     followed by the world-space unit direction from camera to primitive center.
     All tensors must be contiguous CUDA float32. Returns channels-last RGB,
     alpha, and named metadata, with first-order parameter and camera gradients.
+    validate=False skips numerical value checks for trusted inputs; shape,
+    dtype, device, and contiguity checks always remain enabled.
     """
     return render(
         means,
@@ -532,4 +503,5 @@ def rasterize_neural_gabors(
         far_plane,
         True,
         None,
+        validate,
     )

@@ -52,3 +52,15 @@ is null.
 The locally generated wheel targets CPython 3.12, Linux x86-64, and SM 8.6; it is
 not a universal wheel. Rebuild from source for a different Python, Torch/CUDA
 stack, or GPU architecture. No package registry publication was performed.
+
+## v0.1.1 local release validation
+
+The 54-test GPU suite passes, including both optional upstream comparisons,
+shared-batch/tail coverage, all-degree SH value/gradient parity, and validation
+fast-path parity. Multi-scene/camera, partial-tile, packed/dense, and SH cases pass
+Compute Sanitizer 12.8 memcheck with zero reported errors. Shared-batch/tail and
+partial-tile stress cases also pass racecheck with zero hazards.
+
+See [performance.md](performance.md) for the measured synthetic control and the
+still-pending trained-model RTX 3090 budgets. The cu129 deployment wheel and
+external application pin have not been changed by this local release work.

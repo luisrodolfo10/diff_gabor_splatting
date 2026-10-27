@@ -5,12 +5,17 @@
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cub/cub.cuh>
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
 #include <cuda_runtime.h>
 #include <climits>
 #include <cmath>
 
 namespace {
+namespace cg = cooperative_groups;
 constexpr int Tile = 16;
+constexpr int BlockSize = Tile * Tile;
+constexpr int BatchSize = 64;
 constexpr int GeometrySize = 17;
 constexpr int MapSize = 9;
 constexpr float Pi = 3.14159265358979323846f;
@@ -103,192 +108,292 @@ __device__ void appearanceForward(const float* a, const float* g, const Sample& 
                                   float* color, float* hidden, float* preactivation) {
     if constexpr (Neural) {
         float input[5] = {v.s[0] / 3, v.s[1] / 3, g[14], g[15], g[16]};
+        #pragma unroll
         for (int h = 0; h < 6; ++h) {
             float z = a[30 + h];
+            #pragma unroll
             for (int k = 0; k < 5; ++k) z += a[h * 5 + k] * input[k];
             preactivation[h] = z;
             hidden[h] = sinf(30 * z);
         }
+        #pragma unroll
         for (int c = 0; c < 3; ++c) {
             float z = a[54 + c];
+            #pragma unroll
             for (int h = 0; h < 6; ++h) z += a[36 + c * 6 + h] * hidden[h];
             color[c] = 1 / (1 + expf(-z));
         }
     } else {
         float h1 = 0, h2 = 0;
+        #pragma unroll
         for (int f = 0; f < 4; ++f) {
             float dot = cosf(Pi * f / 4) * v.s[0] + sinf(Pi * f / 4) * v.s[1];
             float wave = cosf(2 * Pi * a[10 + f] * dot + a[14 + f]);
             h1 += a[6 + f] * 0.5f * (1 + wave);
             h2 += a[6 + f] * 0.5f * (1 - wave);
         }
+        #pragma unroll
         for (int c = 0; c < 3; ++c) color[c] = h1 * a[c] + h2 * a[3 + c];
     }
+}
+
+// Combine one primitive's pixel derivatives before issuing a single atomic per warp.
+__device__ __forceinline__ void warpAtomicAdd(cg::thread_block_tile<32> warp, float* target, float value) {
+    float sum = cg::reduce(warp, value, cg::plus<float>());
+    if (warp.thread_rank() == 0 && sum != 0.0f) atomicAdd(target, sum);
 }
 
 // Differentiate appearance into primitive parameters, local coordinates, and view direction.
 template<bool Neural>
 __device__ void appearanceBackward(const float* a, const float* g, const Sample& v,
     const float* color, const float* hidden, const float* preactivation,
-    const float* gc, float* ga, float* gg, float* gs) {
+    const float* gc, float* ga, float* gg, float* gs, cg::thread_block_tile<32> warp) {
     if constexpr (Neural) {
         float input[5] = {v.s[0] / 3, v.s[1] / 3, g[14], g[15], g[16]};
         float gh[6] = {}, gi[5] = {};
+        #pragma unroll
         for (int c = 0; c < 3; ++c) {
             float gz = gc[c] * color[c] * (1 - color[c]);
-            atomicAdd(ga + 54 + c, gz);
+            warpAtomicAdd(warp, ga + 54 + c, gz);
+            #pragma unroll
             for (int h = 0; h < 6; ++h) {
-                atomicAdd(ga + 36 + c * 6 + h, gz * hidden[h]);
+                warpAtomicAdd(warp, ga + 36 + c * 6 + h, gz * hidden[h]);
                 gh[h] += gz * a[36 + c * 6 + h];
             }
         }
+        #pragma unroll
         for (int h = 0; h < 6; ++h) {
             float gz = gh[h] * 30 * cosf(30 * preactivation[h]);
-            atomicAdd(ga + 30 + h, gz);
+            warpAtomicAdd(warp, ga + 30 + h, gz);
+            #pragma unroll
             for (int k = 0; k < 5; ++k) {
-                atomicAdd(ga + h * 5 + k, gz * input[k]);
+                warpAtomicAdd(warp, ga + h * 5 + k, gz * input[k]);
                 gi[k] += gz * a[h * 5 + k];
             }
         }
         gs[0] += gi[0] / 3; gs[1] += gi[1] / 3;
-        for (int k = 0; k < 3; ++k) atomicAdd(gg + 14 + k, gi[k + 2]);
+        for (int k = 0; k < 3; ++k) gg[14 + k] += gi[k + 2];
     } else {
+        #pragma unroll
         for (int f = 0; f < 4; ++f) {
             float dx = cosf(Pi * f / 4), dy = sinf(Pi * f / 4);
             float dot = dx * v.s[0] + dy * v.s[1];
             float angle = 2 * Pi * a[10 + f] * dot + a[14 + f];
             float wave = cosf(angle), gw = 0, gt = 0;
+            #pragma unroll
             for (int c = 0; c < 3; ++c) {
-                atomicAdd(ga + c, gc[c] * a[6 + f] * 0.5f * (1 + wave));
-                atomicAdd(ga + 3 + c, gc[c] * a[6 + f] * 0.5f * (1 - wave));
+                ga[c] += gc[c] * a[6 + f] * 0.5f * (1 + wave);
+                ga[3 + c] += gc[c] * a[6 + f] * 0.5f * (1 - wave);
                 gw += gc[c] * 0.5f * ((1 + wave) * a[c] + (1 - wave) * a[3 + c]);
                 gt += gc[c] * a[6 + f] * 0.5f * sinf(angle) * (a[3 + c] - a[c]);
             }
-            atomicAdd(ga + 6 + f, gw);
-            atomicAdd(ga + 10 + f, gt * 2 * Pi * dot);
-            atomicAdd(ga + 14 + f, gt);
+            ga[6 + f] += gw;
+            ga[10 + f] += gt * 2 * Pi * dot;
+            ga[14 + f] += gt;
             gs[0] += gt * 2 * Pi * a[10 + f] * dx;
             gs[1] += gt * 2 * Pi * a[10 + f] * dy;
         }
     }
 }
 
-// Composite every image tile; each CUDA thread owns one output pixel.
+// Shared primitive data used by every pixel in a tile batch.
+template<int AppearanceSize>
+struct PrimitiveBatch {
+    int ids[BatchSize];
+    int64_t primitives[BatchSize];
+    float geometry[BatchSize * GeometrySize];
+    float appearance[BatchSize * AppearanceSize];
+    float opacities[BatchSize];
+};
+
+// Cooperatively gather contiguous primitive records; all tile threads must participate.
+template<int AppearanceSize>
+__device__ void loadBatch(PrimitiveBatch<AppearanceSize>& batch, int start, int stride,
+    int count, int rank, const int* point_list, const int64_t* primitive_ids,
+    const float* geometry, const float* appearance, const float* opacities) {
+    __syncthreads();
+    if (rank < count) {
+        int id = point_list[start + stride * rank];
+        batch.ids[rank] = id;
+        batch.primitives[rank] = primitive_ids[id];
+        batch.opacities[rank] = opacities[primitive_ids[id]];
+    }
+    __syncthreads();
+    for (int i = rank; i < count * GeometrySize; i += BlockSize)
+        batch.geometry[i] = geometry[int64_t(batch.ids[i / GeometrySize]) * GeometrySize + i % GeometrySize];
+    for (int i = rank; i < count * AppearanceSize; i += BlockSize)
+        batch.appearance[i] = appearance[batch.primitives[i / AppearanceSize] * AppearanceSize + i % AppearanceSize];
+    __syncthreads();
+}
+
+// Composite shared primitive batches, keeping per-pixel accumulation in registers.
 template<bool Neural>
-__global__ void renderForward(int width, int height, int tw, const float* geometry,
+__global__ __launch_bounds__(BlockSize) void renderForward(int width, int height, int tw, const float* geometry,
     const float* appearance, const float* opacities, const int64_t* primitive_ids,
     const float* backgrounds, const int* point_list, const int2* ranges,
     float near_plane, float far_plane, float* maps, float* state, int* contributors) {
+    constexpr int AppearanceSize = Neural ? 57 : 18;
+    __shared__ PrimitiveBatch<AppearanceSize> batch;
     int th = (height + Tile - 1) / Tile, tile = blockIdx.x;
     int image = tile / (tw * th), local = tile % (tw * th);
     int x = (local % tw) * Tile + threadIdx.x, y = (local / tw) * Tile + threadIdx.y;
-    if (x >= width || y >= height) return;
+    int rank = threadIdx.y * Tile + threadIdx.x;
+    bool inside = x < width && y < height, done = !inside;
     int64_t pixel = (int64_t(image) * height + y) * width + x;
-    float* out = maps + pixel * MapSize;
-    float T = 1, m1 = 0, m2 = 0;
+    float out[MapSize] = {}, T = 1, m1 = 0, m2 = 0;
     int last = 0;
     int2 range = ranges[tile];
-    for (int pos = range.x; pos < range.y; ++pos) {
-        int id = point_list[pos];
-        int64_t primitive = primitive_ids[id];
-        const float* g = geometry + id * GeometrySize;
-        Sample v;
-        if (!sampleSurface(g, opacities[primitive], x, y, Neural, near_plane, v)) continue;
-        float next = T * (1 - v.alpha);
-        if (next < 0.0001f) break;
-        float color[3], hidden[6], preactivation[6];
-        appearanceForward<Neural>(appearance + primitive * (Neural ? 57 : 18), g, v,
-                                  color, hidden, preactivation);
-        float w = T * v.alpha;
-        float m = far_plane / (far_plane - near_plane) * (1 - near_plane / v.depth);
-        for (int c = 0; c < 3; ++c) {
-            out[c] += w * color[c];
-            out[5 + c] += w * g[11 + c];
+    for (int start = range.x; start < range.y; start += BatchSize) {
+        if (__syncthreads_count(done) == BlockSize) break;
+        int count = min(BatchSize, range.y - start);
+        loadBatch(batch, start, 1, count, rank, point_list, primitive_ids, geometry, appearance, opacities);
+        for (int j = 0; j < count && !done; ++j) {
+            const float* g = batch.geometry + j * GeometrySize;
+            Sample v;
+            if (!sampleSurface(g, batch.opacities[j], x, y, Neural, near_plane, v)) continue;
+            float next = T * (1 - v.alpha);
+            if (next < 0.0001f) { done = true; break; }
+            float color[3], hidden[6], preactivation[6];
+            appearanceForward<Neural>(batch.appearance + j * AppearanceSize, g, v, color, hidden, preactivation);
+            float w = T * v.alpha;
+            float m = far_plane / (far_plane - near_plane) * (1 - near_plane / v.depth);
+            #pragma unroll
+            for (int c = 0; c < 3; ++c) {
+                out[c] += w * color[c];
+                out[5 + c] += w * g[11 + c];
+            }
+            out[4] += w * v.depth;
+            out[8] += w * (m * m * (1 - T) + m2 - 2 * m * m1);
+            m1 += w * m; m2 += w * m * m;
+            T = next;
+            last = start + j - range.x + 1;
         }
-        out[4] += w * v.depth;
-        out[8] += w * (m * m * (1 - T) + m2 - 2 * m * m1);
-        m1 += w * m; m2 += w * m * m;
-        T = next;
-        last = pos - range.x + 1;
     }
-    for (int c = 0; c < 3; ++c) out[c] += T * backgrounds[image * 3 + c];
-    out[3] = 1 - T;
-    state[pixel * 3] = T; state[pixel * 3 + 1] = m1; state[pixel * 3 + 2] = m2;
-    contributors[pixel] = last;
+    if (inside) {
+        #pragma unroll
+        for (int c = 0; c < 3; ++c) out[c] += T * backgrounds[image * 3 + c];
+        out[3] = 1 - T;
+        #pragma unroll
+        for (int c = 0; c < MapSize; ++c) maps[pixel * MapSize + c] = out[c];
+        state[pixel * 3] = T; state[pixel * 3 + 1] = m1; state[pixel * 3 + 2] = m2;
+        contributors[pixel] = last;
+    }
 }
 
-// Replay accepted contributors backwards, including alpha, depth, normal, and distortion losses.
+// Replay shared reverse batches and reduce all primitive gradients within each warp.
 template<bool Neural>
-__global__ void renderBackward(int width, int height, int tw, const float* geometry,
+__global__ __launch_bounds__(BlockSize) void renderBackward(int width, int height, int tw, const float* geometry,
     const float* appearance, const float* opacities, const int64_t* primitive_ids,
     const float* backgrounds, const int* point_list, const int2* ranges,
     const float* state, const int* contributors, const float* grad_maps,
     float near_plane, float far_plane, float* grad_geometry, float* grad_appearance,
     float* grad_opacities, float* grad_backgrounds) {
+    constexpr int AppearanceSize = Neural ? 57 : 18;
+    __shared__ PrimitiveBatch<AppearanceSize> batch;
+    using BlockMax = cub::BlockReduce<int, Tile, cub::BLOCK_REDUCE_WARP_REDUCTIONS, Tile>;
+    __shared__ BlockMax::TempStorage max_storage;
+    __shared__ int block_last;
+    auto warp = cg::tiled_partition<32>(cg::this_thread_block());
     int th = (height + Tile - 1) / Tile, tile = blockIdx.x;
     int image = tile / (tw * th), local = tile % (tw * th);
     int x = (local % tw) * Tile + threadIdx.x, y = (local / tw) * Tile + threadIdx.y;
-    if (x >= width || y >= height) return;
+    int rank = threadIdx.y * Tile + threadIdx.x;
+    bool inside = x < width && y < height;
     int64_t pixel = (int64_t(image) * height + y) * width + x;
-    const float* go = grad_maps + pixel * MapSize;
-    float final_t = state[pixel * 3], T = final_t;
-    float total_a = 1 - final_t, m1 = state[pixel * 3 + 1], m2 = state[pixel * 3 + 2];
+    int last = inside ? contributors[pixel] : 0;
+    int maximum = BlockMax(max_storage).Reduce(last, cub::Max());
+    if (rank == 0) block_last = maximum;
+    float go[MapSize] = {};
+    if (inside) {
+        #pragma unroll
+        for (int c = 0; c < MapSize; ++c) go[c] = grad_maps[pixel * MapSize + c];
+    }
+    float final_t = inside ? state[pixel * 3] : 0, T = final_t;
+    float total_a = 1 - final_t;
+    float m1 = inside ? state[pixel * 3 + 1] : 0, m2 = inside ? state[pixel * 3 + 2] : 0;
     float background_dot = 0, suffix = 0;
+    #pragma unroll
     for (int c = 0; c < 3; ++c) {
         background_dot += go[c] * backgrounds[image * 3 + c];
-        atomicAdd(grad_backgrounds + image * 3 + c, final_t * go[c]);
+        warpAtomicAdd(warp, grad_backgrounds + image * 3 + c, final_t * go[c]);
     }
+    __syncthreads();
     int2 range = ranges[tile];
-    for (int pos = range.x + contributors[pixel] - 1; pos >= range.x; --pos) {
-        int id = point_list[pos];
-        int64_t primitive = primitive_ids[id];
-        const float* g = geometry + id * GeometrySize;
-        const float* a = appearance + primitive * (Neural ? 57 : 18);
-        float* gg = grad_geometry + id * GeometrySize;
-        float* ga = grad_appearance + primitive * (Neural ? 57 : 18);
-        Sample v;
-        if (!sampleSurface(g, opacities[primitive], x, y, Neural, near_plane, v)) continue;
-        T /= 1 - v.alpha;
-        float w = T * v.alpha;
-        float color[3], hidden[6], preactivation[6], gc[3], gs[2] = {};
-        appearanceForward<Neural>(a, g, v, color, hidden, preactivation);
-        float mscale = far_plane / (far_plane - near_plane);
-        float m = mscale * (1 - near_plane / v.depth);
-        float gw = go[4] * v.depth + go[8] * (m * m * total_a + m2 - 2 * m * m1);
-        for (int c = 0; c < 3; ++c) {
-            gw += go[c] * color[c] + go[5 + c] * g[11 + c];
-            gc[c] = w * go[c];
-            atomicAdd(gg + 11 + c, w * go[5 + c]);
-        }
-        float galpha = T * gw - suffix / (1 - v.alpha)
-                     + final_t * (go[3] - background_dot) / (1 - v.alpha);
-        suffix += w * gw;
-        appearanceBackward<Neural>(a, g, v, color, hidden, preactivation, gc, ga, gg, gs);
-        float gz = w * go[4] + go[8] * 2 * w * (m * total_a - m1)
-                   * mscale * near_plane / (v.depth * v.depth);
-        if (Neural || v.surface) {
-            gs[0] += gz * g[6]; gs[1] += gz * g[7];
-            atomicAdd(gg + 6, gz * v.s[0]); atomicAdd(gg + 7, gz * v.s[1]);
-        }
-        atomicAdd(gg + 8, gz);
-        float grho = 0;
-        if (opacities[primitive] * v.exponential < 0.99f) {
-            atomicAdd(grad_opacities + primitive, galpha * v.exponential);
-            grho = -0.5f * galpha * opacities[primitive] * v.exponential;
-        }
-        if (v.surface) {
-            gs[0] += 2 * v.s[0] * grho; gs[1] += 2 * v.s[1] * grho;
-        } else {
-            atomicAdd(gg + 9, 4 * (g[9] - x) * grho);
-            atomicAdd(gg + 10, 4 * (g[10] - y) * grho);
-        }
-        float gp[3] = {gs[0] / v.p[2], gs[1] / v.p[2],
-                        -(gs[0] * v.s[0] + gs[1] * v.s[1]) / v.p[2]};
-        float gk[3], gl[3];
-        crossProduct(v.l, gp, gk); crossProduct(gp, v.k, gl);
-        for (int k = 0; k < 3; ++k) {
-            atomicAdd(gg + k, -gk[k]); atomicAdd(gg + 3 + k, -gl[k]);
-            atomicAdd(gg + 6 + k, x * gk[k] + y * gl[k]);
+    for (int start = block_last; start > 0; start -= BatchSize) {
+        int count = min(BatchSize, start);
+        loadBatch(batch, range.x + start - 1, -1, count, rank, point_list, primitive_ids,
+                  geometry, appearance, opacities);
+        for (int j = 0; j < count; ++j) {
+            const float* g = batch.geometry + j * GeometrySize;
+            const float* a = batch.appearance + j * AppearanceSize;
+            Sample v{};
+            bool active = inside && start - j <= last;
+            if (active) active = sampleSurface(g, batch.opacities[j], x, y, Neural, near_plane, v);
+            if (!warp.ballot(active)) continue;
+            if (!active) v = Sample{};
+            float gg[GeometrySize] = {}, ga[Neural ? 1 : AppearanceSize] = {}, gopacity = 0;
+            float color[3] = {}, hidden[6] = {}, preactivation[6] = {}, gc[3] = {}, gs[2] = {};
+            float w = 0, m = 0, galpha = 0;
+            float mscale = far_plane / (far_plane - near_plane);
+            if (active) {
+                T /= 1 - v.alpha;
+                w = T * v.alpha;
+                appearanceForward<Neural>(a, g, v, color, hidden, preactivation);
+                m = mscale * (1 - near_plane / v.depth);
+                float gw = go[4] * v.depth + go[8] * (m * m * total_a + m2 - 2 * m * m1);
+                #pragma unroll
+                for (int c = 0; c < 3; ++c) {
+                    gw += go[c] * color[c] + go[5 + c] * g[11 + c];
+                    gc[c] = w * go[c];
+                    gg[11 + c] += w * go[5 + c];
+                }
+                galpha = T * gw - suffix / (1 - v.alpha)
+                             + final_t * (go[3] - background_dot) / (1 - v.alpha);
+                suffix += w * gw;
+            }
+            int id = batch.ids[j];
+            int64_t primitive = batch.primitives[j];
+            appearanceBackward<Neural>(a, g, v, color, hidden, preactivation, gc,
+                Neural ? grad_appearance + primitive * AppearanceSize : ga, gg, gs, warp);
+            if (active) {
+                float gz = w * go[4] + go[8] * 2 * w * (m * total_a - m1)
+                           * mscale * near_plane / (v.depth * v.depth);
+                if (Neural || v.surface) {
+                    gs[0] += gz * g[6]; gs[1] += gz * g[7];
+                    gg[6] += gz * v.s[0]; gg[7] += gz * v.s[1];
+                }
+                gg[8] += gz;
+                float grho = 0;
+                if (batch.opacities[j] * v.exponential < 0.99f) {
+                    gopacity = galpha * v.exponential;
+                    grho = -0.5f * galpha * batch.opacities[j] * v.exponential;
+                }
+                if (v.surface) {
+                    gs[0] += 2 * v.s[0] * grho; gs[1] += 2 * v.s[1] * grho;
+                } else {
+                    gg[9] += 4 * (g[9] - x) * grho;
+                    gg[10] += 4 * (g[10] - y) * grho;
+                }
+                float gp[3] = {gs[0] / v.p[2], gs[1] / v.p[2],
+                                -(gs[0] * v.s[0] + gs[1] * v.s[1]) / v.p[2]};
+                float gk[3], gl[3];
+                crossProduct(v.l, gp, gk); crossProduct(gp, v.k, gl);
+                #pragma unroll
+                for (int k = 0; k < 3; ++k) {
+                    gg[k] -= gk[k]; gg[3 + k] -= gl[k];
+                    gg[6 + k] += x * gk[k] + y * gl[k];
+                }
+            }
+
+            #pragma unroll
+            for (int k = 0; k < GeometrySize; ++k)
+                warpAtomicAdd(warp, grad_geometry + int64_t(id) * GeometrySize + k, gg[k]);
+            if constexpr (!Neural) {
+                #pragma unroll
+                for (int k = 0; k < AppearanceSize; ++k)
+                    warpAtomicAdd(warp, grad_appearance + primitive * AppearanceSize + k, ga[k]);
+            }
+            warpAtomicAdd(warp, grad_opacities + primitive, gopacity);
         }
     }
 }

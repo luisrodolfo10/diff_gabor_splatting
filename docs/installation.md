@@ -22,7 +22,7 @@ version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = [
   "torch==2.8.*",
-  "gabor-splatting @ git+https://github.com/luisrodolfo10/diff_gabor_splatting.git@v0.1.0",
+  "gabor-splatting @ git+https://github.com/luisrodolfo10/diff_gabor_splatting.git@v0.1.1",
 ]
 
 [tool.uv.extra-build-dependencies]
@@ -50,7 +50,7 @@ keeps the build's Torch aligned with the application. This follows uv's
 [per-package build configuration](https://docs.astral.sh/uv/concepts/projects/config/#augmenting-build-dependencies).
 
 The public HTTPS URL needs no GitHub SSH key. An authenticated SSH source can
-instead use `git+ssh://git@github.com/luisrodolfo10/diff_gabor_splatting.git@v0.1.0`.
+instead use `git+ssh://git@github.com/luisrodolfo10/diff_gabor_splatting.git@v0.1.1`.
 
 ## Work from a checkout
 

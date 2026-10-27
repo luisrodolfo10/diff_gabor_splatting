@@ -397,3 +397,43 @@ def test_degenerate_surfaces_have_finite_zero_gradients(method, case):
         assert value.grad is not None and torch.isfinite(value.grad).all(), name
         if name != "backgrounds":
             assert value.grad.count_nonzero() == 0, name
+
+
+@pytest.mark.parametrize("method", ["classic", "neural"])
+def test_trusted_input_path_skips_only_value_checks(method, monkeypatch):
+    """Keep structural checks and identical images/gradients when numerical validation is disabled."""
+    import gabor_splatting.rendering as rendering
+
+    values = make_inputs(method)
+    expected = maps_from_result(renderer(method)(**values, width=9, height=9))
+
+    def unexpected_value_check(*args):
+        """Fail if the trusted path accidentally invokes numerical validation."""
+        raise AssertionError("check_values should not be called")
+
+    monkeypatch.setattr(rendering, "check_values", unexpected_value_check)
+    actual = maps_from_result(renderer(method)(**values, width=9, height=9, validate=False))
+    torch.testing.assert_close(actual, expected)
+    ag = torch.autograd.grad(actual.sum(), tuple(values.values()), retain_graph=True)
+    eg = torch.autograd.grad(expected.sum(), tuple(values.values()))
+    for a, e in zip(ag, eg):
+        torch.testing.assert_close(a, e, atol=2e-3, rtol=1e-3)
+    invalid = dict(values, scales=values["scales"].double())
+    with pytest.raises(ValueError, match="scales must be float32"):
+        renderer(method)(**invalid, width=9, height=9, validate=False)
+
+
+@pytest.mark.parametrize("method", ["classic", "neural"])
+def test_shared_batch_boundary_matches_reference(method):
+    """Exercise a full shared batch plus a tail with different per-pixel contributor counts."""
+    values = make_inputs(method, cameras=1, primitives=65)
+    with torch.no_grad():
+        values["opacities"].fill_(0.03)
+    actual = maps_from_result(renderer(method)(**values, width=9, height=9))
+    expected = reference(method, values)
+    torch.testing.assert_close(actual.double(), expected, atol=4e-6, rtol=3e-5)
+    weights = torch.linspace(-0.4, 0.7, actual.numel(), device="cuda").reshape(actual.shape)
+    ag = torch.autograd.grad((actual * weights).sum(), tuple(values.values()))
+    eg = torch.autograd.grad((expected * weights).sum(), tuple(values.values()))
+    for name, a, e in zip(values, ag, eg):
+        torch.testing.assert_close(a, e, atol=2e-3, rtol=1e-3, msg=name)

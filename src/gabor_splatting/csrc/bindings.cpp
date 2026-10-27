@@ -6,4 +6,6 @@
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     module.def("rasterize_forward", &rasterizeForward);
     module.def("rasterize_backward", &rasterizeBackward);
+    module.def("evaluate_sh_forward", &evaluateSHForward);
+    module.def("evaluate_sh_backward", &evaluateSHBackward);
 }

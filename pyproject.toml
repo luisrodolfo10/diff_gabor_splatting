@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gabor-splatting"
-version = "0.1.0"
+version = "0.1.1"
 description = "Differentiable classic and neural Gabor surface splatting with fused CUDA batches"
 readme = "README.md"
 requires-python = ">=3.10"

@@ -53,7 +53,9 @@ With `sh_degree=0..3`, both colors instead have shape
 `[..., N, (degree+1)**2, 3]`. Real SH use the Inria ordering and constants. Direction
 is the normalized world vector from camera center to primitive center. SH RGB is
 `clamp_min(evaluate_sh(coefficients, direction)+0.5, 0)`. Color coefficients are
-shared across cameras; evaluated colors are camera-specific.
+shared across cameras; evaluated colors are camera-specific. Both colors are
+evaluated together in one CUDA kernel, with coefficient and direction gradients
+computed by a matching fused backward kernel.
 
 Neural Gabor uses one 5→6→3 network per primitive. Input weights are `[6,5]`,
 input biases `[6]`, output weights `[3,6]`, and output biases `[3]` after the scene
@@ -122,8 +124,16 @@ its paper is cited in [references.bib](../references.bib).
 All native work uses the current device and current CUDA stream. One CUB scan,
 one image-aware tile/depth sort, and one compositor launch serve every scene and
 camera in a call. Native rendering uses float32 atomics in backward, so sums may
-vary slightly between runs and between fused/loop implementations. Numerical
-input checks synchronize once per call. Allocating variable-size tile intersection
+vary slightly between runs and between fused/loop implementations. Forward and
+backward stage batches of 64 primitive records in shared memory. Backward starts
+at the tile's largest contributor count; all lanes participate in each warp sum,
+with inactive pixels contributing zero, and lane zero updates global gradients.
+
+`validate=True` (the default) checks numerical values and synchronizes once per
+call. `validate=False` skips `check_values` for trusted inputs, removing its
+finite/range/normalization checks and synchronization. Shape, dtype, device,
+contiguity, and scalar-option checks stay enabled. Invalid numerical values on
+the trusted path violate the API contract. Allocating variable-size tile intersection
 storage also requires a stream synchronization after the scan. CUDA graph capture
 is not supported. There is no CPU or alternative-backend fallback.
 
